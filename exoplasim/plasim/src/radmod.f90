@@ -90,13 +90,78 @@
       real :: bscat1 = 0. ! Backscattering ratio band 1
       real :: bscat2 = 0. ! Backscattering ratio band 2
       real :: aeroqs(8,1) = 0.  ! Array to read in aerosol optical constants
-      real :: apart = 50e-09 ! Aerosol particle radius - DECLARED IN AEROMOD AS WELL
+      real :: apart = 50e-09 ! Aerosol particle radius. AEROMOD DECLARES ITS
+                             ! OWN; aero_ini copies that one into this and
+                             ! radini broadcasts it. The default is the
+                             ! photochemical haze and is not the modelled dust.
+!
+!*    2.2b) PRESCRIBED DUST ()
+!
+!     A supplied, non-interacting dust field: the radiation sees a column
+!     optical depth read as a surface boundary field and nothing transports,
+!     emits or removes anything. That is enough to answer what dust does to
+!     precipitation and runoff one iteration deep, and it deliberately does NOT
+!     touch aerocore, so the bottom-level sink, the settling term and the
+!     interactive number density are all out of the path.
+!
+!     ddustcol is the BAND 1 (0.34-0.75 um) column extinction optical depth.
+!     Band 2 follows from the aerofile's own ratio of extinction efficiencies
+!     and the thermal infrared from dustqlw, so one field carries all three and
+!     the spectral ratios stay where the optics are.
+!
+      integer :: ndustrad = 0     ! prescribed dust radiation off (0) or on (1)
+      real    :: dustsc  = 1.0    ! multiplier on the prescribed column optical depth
+      real    :: dusthsc = 3000.0 ! dust scale height (m), concentration e-folding
+      real    :: dustqlw = 0.0    ! thermal-IR ABSORPTION optical depth per unit
+                                  ! band-1 extinction optical depth. There is no
+                                  ! defensible default: a shortwave-only dust is
+                                  ! worse than no dust, so radini ABORTS if this
+                                  ! is left at zero with ndustrad = 1.
+      logical :: ldustchk = .true.  ! report the column normalisation once
+!
+!*    2.2c) INTERACTIVE AEROSOL, AND ITS LONGWAVE ()
+!
+!     The aerosol aerocore transports acted in the two SHORTWAVE bands and
+!     nowhere else, so the model could cool with dust and could not warm with
+!     it. On this world that is not a refinement: an offline calculation
+!     prices shortwave-only dust against the full calculation at several W/m2
+!     in the global mean, which is second in the whole error budget.
+!
+!     The physics is the prescribed path's, unchanged: a grey ABSORBER at the
+!     same 1.66 diffusivity the cloud term uses, multiplied into the total
+!     layer transmissivity so that overlap with water vapour and CO2 is handled
+!     by construction. What is new here is only WHERE the optical depth comes
+!     from -- the model's own number density instead of a boundary field.
+!
+!     aeroqlw is that ratio for the interactive aerosol and dustqlw is the one
+!     for the prescribed field. They are kept apart because the two paths carry
+!     different particles: the prescribed field is the modelled dust at the
+!     offline chain's size distribution, while the interactive tracer is
+!     whatever aero_nl's apart and rhop describe. There is no defensible
+!     default for either, so radini ABORTS on an interactive aerosol with
+!     aeroqlw left at zero, exactly as it does for ndustrad with dustqlw.
+!
+!     The two paths are mutually exclusive and radini refuses both at once: a
+!     prescribed column and a transported one are two aerosols, and adding
+!     their optical depths would count one of them twice.
+!
+      real    :: aeroqlw = 0.0    ! thermal-IR ABSORPTION optical depth per unit
+                                  ! band-1 extinction optical depth, INTERACTIVE
+                                  ! aerosol. No defensible default; radini
+                                  ! aborts if it is zero with the aerosol on.
+      integer :: iaerint = 0      ! 1 where the transported aerosol acts on the
+                                  ! radiation, else 0. Set once in radini from
+                                  ! l_aero and l_aerorad, so swr, lwr and
+                                  ! radstep all ask the same question.
 !
 !*    2.3) arrays
 !
 
       real :: gmu0(NHOR)                   ! cosine of solar zenit angle
       real :: gmu1(NHOR)                   ! cosine of solar zenit angle
+      real :: ddustcol(NHOR)     = 0.      ! prescribed band-1 column optical depth
+      real :: ddustod(NHOR,NLEV) = 0.      ! band-1 optical depth per layer
+      real :: daerod(NHOR,NLEV)  = 0.      ! interactive band-1 optical depth per layer
 !       real :: dtdtlwr(NHOR,NLEV)           ! lwr temperature tendencies (now in pumamod)
 !       real :: dtdtswr(NHOR,NLEV)           ! swr temperature tendencies (now in pumamod)
 
@@ -585,6 +650,8 @@
       subroutine radini
       use radmod
 !
+      logical :: lexaero        ! does the aerosol optics file exist
+!
 !     initialize radiation
 !     this *sub* is called by PUMA (PUMA-interface)
 !
@@ -608,8 +675,8 @@
      &               ,a0o3,a1o3,aco3,bo3,co3,toffo3,o3scale,newrsc,necham,necham6   &
      &               ,nsol,nclouds,nswrcl,nrscat,rcl1,rcl2,acl2,clgray,tpofmt   &
      &               ,acllwr,tswr1,tswr2,tswr3,th2oc,dawn,starbbtemp,nstartemp  &
-     &               ,nsimplealbedo,nstarfile,starfile,starfilehr,minwavel
-     namelist/aero_nl/l_source,l_bulk,apart,rhop,fcoeff,l_aerorad,aerofile
+     &               ,nsimplealbedo,nstarfile,starfile,starfilehr,minwavel      &
+     &               ,ndustrad,dustsc,dusthsc,dustqlw,aerofile,aeroqlw
 !
 !     namelist parameter:
 !
@@ -794,6 +861,21 @@
       call mpbcr(minwavel)
       
       call mpbci(l_aerorad)
+!
+!     aero_ini has already run, on NROOT only, and has copied aero_nl's
+!     particle radius into radmod's own. This is the broadcast that was
+!     missing: without it every rank kept the 50 nm default and the
+!     shortwave aerosol optical depth was (50e-9/apart)**2 of intent.
+!     Harmless where aero_ini never ran, because both copies are then the
+!     same default.
+!
+      call mpbcr(apart)
+
+      call mpbci(ndustrad)
+      call mpbcr(dustsc)
+      call mpbcr(dusthsc)
+      call mpbcr(dustqlw)
+      call mpbcr(aeroqlw)
 
 !      
 !     determine stellar parameters      
@@ -897,8 +979,23 @@
        dqco2(:,:)=co2
       endif
       
-      if (l_aero > 0 .and. l_aerorad == 1) then
+      if ((l_aero > 0 .and. l_aerorad == 1) .or. ndustrad == 1) then
        if (mypid == NROOT) then
+!
+!     readdat opens with the default status, so a missing aerofile is CREATED
+!     empty and the failure arrives as an end-of-file inside a utility rather
+!     than as a statement about the aerosol. Say what is wrong instead.
+!
+!     `aerofile` is settable from radmod_nl as well as aero_nl, because the
+!     prescribed-dust path does not run aero_ini: that is only called when the
+!     semi-Lagrangian tracer transport is on, and nothing here is transported.
+!     aero_ini runs BEFORE radini, so radmod_nl wins when both name a file.
+!
+        inquire(file=aerofile,exist=lexaero)
+        if (.not. lexaero) then
+         write(nud,*) 'aerosol optics file not found: ',trim(aerofile)
+         call mpabort('aerofile is missing')
+        endif
         call readdat(aerofile,1,8,aeroqs) ! Get Qextinction, Qscattering, Qbackscatter, g for band 1 & 2
         
         ssa1 = aeroqs(2,1)/aeroqs(1,1) ! Single scattering albedo band 1 (qscat/qext)
@@ -915,6 +1012,72 @@
         call mpbcr(bscat2)
         call mpbcr(qex1)
         call mpbcr(qex2)
+      endif
+!
+!     prescribed dust: the column optical depth field, and the two things that
+!     make enabling it without them a silent wrong answer rather than a loud one
+!
+      if (ndustrad == 1) then
+       if (dustqlw <= 0.) then
+        if (mypid == NROOT) then
+         write(nud,*) 'PRESCRIBED DUST: dustqlw is ',dustqlw
+         write(nud,*) 'The aerosol acts in the two SHORTWAVE bands only unless'
+         write(nud,*) 'a thermal-infrared absorption ratio is supplied, and a'
+         write(nud,*) 'shortwave-only dust is a larger error than no dust.'
+        endif
+        call mpabort('ndustrad=1 requires dustqlw > 0')
+       endif
+       ddustcol(:) = 0.
+       call mpsurfgp('ddustcol',ddustcol,NHOR,1)
+       call mpmaxval(ddustcol,NHOR,1,zdustmx)
+       if (zdustmx <= 0.) then
+        if (mypid == NROOT) then
+         write(nud,*) 'PRESCRIBED DUST: no dust field was read.'
+         write(nud,*) 'Expected surface code 1811 in the run directory.'
+        endif
+        call mpabort('ndustrad=1 but surface code 1811 is absent or zero')
+       endif
+       if (mypid == NROOT) then
+        write(nud,'(/," *********************************************")')
+        write(nud,'(" * PRESCRIBED DUST (code 1811) is ON         *")')
+        write(nud,'(" *********************************************")')
+        write(nud,*) 'max band-1 column optical depth ',zdustmx
+        write(nud,*) 'scale factor                    ',dustsc
+        write(nud,*) 'scale height (m)                ',dusthsc
+        write(nud,*) 'thermal-IR absorption ratio     ',dustqlw
+        write(nud,*) 'band 2 / band 1 extinction      ',qex2/qex1
+       endif
+      endif
+!
+!     interactive aerosol: one switch, asked once, and the two ways of
+!     enabling it that are silently wrong rather than loudly wrong
+!
+      iaerint = 0
+      if (l_aero > 0 .and. l_aerorad == 1) iaerint = 1
+      if (iaerint == 1 .and. ndustrad == 1) then
+       if (mypid == NROOT) then
+        write(nud,*) 'A transported aerosol and a prescribed dust column are'
+        write(nud,*) 'two aerosols, and their optical depths would add. Run'
+        write(nud,*) 'one of them: l_aerorad = 1 or ndustrad = 1, not both.'
+       endif
+       call mpabort('l_aerorad=1 and ndustrad=1 are mutually exclusive')
+      endif
+      if (iaerint == 1 .and. aeroqlw <= 0.) then
+       if (mypid == NROOT) then
+        write(nud,*) 'INTERACTIVE AEROSOL: aeroqlw is ',aeroqlw
+        write(nud,*) 'The aerosol acts in the two SHORTWAVE bands only unless'
+        write(nud,*) 'a thermal-infrared absorption ratio is supplied, and a'
+        write(nud,*) 'shortwave-only aerosol is a larger error than none.'
+       endif
+       call mpabort('l_aerorad=1 requires aeroqlw > 0')
+      endif
+      if (iaerint == 1 .and. mypid == NROOT) then
+       write(nud,'(/," *********************************************")')
+       write(nud,'(" * INTERACTIVE AEROSOL RADIATION is ON       *")')
+       write(nud,'(" *********************************************")')
+       write(nud,*) 'particle radius (m)             ',apart
+       write(nud,*) 'thermal-IR absorption ratio     ',aeroqlw
+       write(nud,*) 'band 2 / band 1 extinction      ',qex2/qex1
       endif
 !
       return
@@ -1012,6 +1175,14 @@
 !**   3) compute ozon distribution
 !
       if(no3<3) call mko3
+!
+!**   3b) distribute the prescribed dust column over the layers
+!
+      if(ndustrad == 1) call dustprof
+!
+!**   3c) build the interactive aerosol's optical depth per layer
+!
+      if(iaerint == 1) call aeroprof
 !
 !**   4) short wave radiation
 !
@@ -1523,6 +1694,126 @@
       return
       end subroutine mko3
 
+!     ===================
+!     SUBROUTINE DUSTPROF
+!     ===================
+
+      subroutine dustprof
+      use radmod
+!
+!     Spread the PRESCRIBED column dust optical depth over the model layers.
+!
+!     The offline chain this field comes from carries dust as a well-mixed
+!     column of declared scale height, so the vertical shape here is the same
+!     one: the concentration decays with `dusthsc` and the layer burden is that
+!     concentration times the layer thickness.
+!
+!     The weights are NORMALISED, so the column optical depth is the prescribed
+!     one to roundoff whatever the temperature profile does to the thicknesses.
+!     That is the point: it makes the model's own column an IDENTITY against the
+!     boundary field rather than a number that has to be believed, and the check
+!     below is written to fail if the normalisation ever stops holding.
+!
+      real :: zdz(NHOR,NLEV)   ! layer thickness (m)
+      real :: zzc(NHOR,NLEV)   ! height of the layer centre above ground (m)
+      real :: zw(NHOR,NLEV)    ! unnormalised layer dust burden
+      real :: zsum(NHOR)       ! column normalisation
+      real :: zcol(NHOR)       ! column optical depth, for the check
+      real :: zres             ! worst column residual, for the check
+!
+      ddustod(:,:) = 0.
+      if (ndustrad /= 1) return
+!
+!     layer thickness in m, built exactly as the shortwave aerosol block builds
+!     it, so the two cannot drift apart
+!
+      do jlev = NLEV,2,-1
+       zdz(:,jlev) = -dt(:,jlev)*gascon/ga*ALOG(sigmah(jlev-1)/sigmah(jlev))
+      enddo
+      zdz(:,1) = -dt(:,1)*gascon/ga*ALOG(sigma(1)/sigmah(1))*0.5
+!
+!     height of each layer centre above the ground
+!
+      zzc(:,NLEV) = 0.5*zdz(:,NLEV)
+      do jlev = NLEV-1,1,-1
+       zzc(:,jlev) = zzc(:,jlev+1)+0.5*(zdz(:,jlev+1)+zdz(:,jlev))
+      enddo
+!
+!     burden per layer, then normalise onto the prescribed column
+!
+      zsum(:) = 0.
+      do jlev = 1,NLEV
+       zw(:,jlev) = EXP(-zzc(:,jlev)/dusthsc)*zdz(:,jlev)
+       zsum(:) = zsum(:)+zw(:,jlev)
+      enddo
+      do jlev = 1,NLEV
+       ddustod(:,jlev) = dustsc*ddustcol(:)*zw(:,jlev)/MAX(zsum(:),1.E-30)
+      enddo
+!
+!     the identity, reported once. A nonzero residual means the vertical
+!     distribution is not conserving the column and every optical depth below
+!     is wrong by that much.
+!
+      if (ldustchk) then
+       ldustchk = .false.
+       zcol(:) = 0.
+       do jlev = 1,NLEV
+        zcol(:) = zcol(:)+ddustod(:,jlev)
+       enddo
+       zres = MAXVAL(ABS(zcol(:)-dustsc*ddustcol(:)))
+       if (mypid == NROOT) then
+        write(nud,*) 'PRESCRIBED DUST: max |column - prescribed| = ',zres
+        write(nud,*) 'PRESCRIBED DUST: layer 1 (top) mass share  = ',        &
+     &               MAXVAL(zw(:,1)/MAX(zsum(:),1.E-30))
+        write(nud,*) 'PRESCRIBED DUST: layer NLEV mass share     = ',        &
+     &               MAXVAL(zw(:,NLEV)/MAX(zsum(:),1.E-30))
+       endif
+      endif
+!
+      return
+      end subroutine dustprof
+
+!     ==================
+!     SUBROUTINE AEROPROF
+!     ==================
+
+      subroutine aeroprof
+      use radmod
+!
+!     Band-1 extinction optical depth per layer for the INTERACTIVE aerosol,
+!     built once per radiation step from the transported number density.
+!
+!     It exists so that the shortwave and the longwave read ONE field. They
+!     used to be unable to disagree only because the longwave had no aerosol
+!     term at all; now that it has one, a second copy of this arithmetic in
+!     swr would be a copy that can drift, and the layer thicknesses depend on
+!     the temperature profile, so it is not a constant that could be built once
+!     and kept.
+!
+!     nrho is floored at one particle per cubic metre, which is what swr did
+!     before this and is kept: the two-stream factors below divide by the
+!     optical depth.
+!
+      real :: zdz(NHOR,NLEV)   ! layer thickness (m)
+      integer :: jlev
+!
+      daerod(:,:) = 0.
+      if (iaerint /= 1) return
+!
+      nrho(:,:) = max(1.0,nrho(:,:))
+!
+      do jlev = NLEV,2,-1
+       zdz(:,jlev) = -dt(:,jlev)*gascon/ga*ALOG(sigmah(jlev-1)/sigmah(jlev))
+      enddo
+      zdz(:,1) = -dt(:,1)*gascon/ga*ALOG(sigma(1)/sigmah(1))*0.5
+!
+      do jlev = 1,NLEV
+       daerod(:,jlev) = nrho(:,jlev)*PI*(apart**2)*qex1*zdz(:,jlev)
+      enddo
+!
+      return
+      end subroutine aeroprof
+
 !     ==============
 !     SUBROUTINE SWR
 !     ==============
@@ -1620,7 +1911,6 @@
       real zrcl1s(NHOR,NLEV),zrcl2s(NHOR,NLEV)! cloud reflexivities (scattered)
       real ztcl2(NHOR,NLEV),ztcl2s(NHOR,NLEV) ! cloud transmissivities
       
-      real zaerdh(NHOR,NLEV)                     ! thickness of an atmospheric layer (m)
       real zaert1(NHOR,NLEV),zaert2(NHOR,NLEV) ! aerosol transmissivities (direct)
       real zaerr1(NHOR,NLEV),zaerr2(NHOR,NLEV) ! aerosol reflectivities (direct)
       real zaert1s(NHOR,NLEV),zaert2s(NHOR,NLEV) ! aerosol transmissivities (scattered)
@@ -1634,6 +1924,7 @@
       real :: zaerd1(NHOR,NLEV),zaerd2(NHOR,NLEV) ! Denominator (direct light)
       real :: zaerd1s(NHOR,NLEV),zaerd2s(NHOR,NLEV) ! (scattered light)
       real :: aod1(NHOR,NLEV),aod2(NHOR,NLEV) ! Aerosol optical depth
+      integer :: iaeron ! 1 where an aerosol acts on the shortwave, else 0
 !
 !     arrays for diagnostic cloud properties
 !
@@ -1815,23 +2106,38 @@
       zaerr1s(:,:) = 0.0
       zaerr2s(:,:) = 0.0
 
-      if (l_aero > 0 .and. l_aerorad == 1) then
-      
+      iaeron = 0
+      if ((l_aero > 0 .and. l_aerorad == 1) .or. ndustrad == 1) iaeron = 1
+
+      if (iaeron == 1) then
+
       ! Aerosol two-stream multiscattering radiative transfer approximation from
       ! Stephens (1978), with data read from outside the model instead of a parameterization
       ! for the effective optical depht and single scattering albedo
-      
-       nrho(:,:) = max(1.0,nrho(:,:)) ! Set number density to minimum 1 particle/m3
-        
-       do jlev=NLEV,2,-1 ! Need layer thickness in m for optical depth - copied from radstep
-        zaerdh(:,jlev)=-dt(:,jlev)*gascon/ga*ALOG(sigmah(jlev-1)/sigmah(jlev))
-       enddo
-       zaerdh(:,1)=-dt(:,1)*gascon/ga*ALOG(sigma(1)/sigmah(1))*0.5
-       
-       do jlev=1,NLEV
-        aod1(:,jlev) = nrho(:,jlev)*PI*(apart**2)*qex1*zaerdh(:,jlev) ! Aerosol optical depth band 1
-        aod2(:,jlev) = nrho(:,jlev)*PI*(apart**2)*qex2*zaerdh(:,jlev) ! Aerosol optical depth band 2
-       enddo
+
+       if (ndustrad == 1) then
+      ! PRESCRIBED dust. The per-layer band-1 optical depth is built by dustprof
+      ! from a supplied column field, and band 2 follows from the aerofile's own
+      ! ratio of extinction efficiencies -- which for a single mode is the ratio
+      ! of the mass extinction efficiencies, so the band split stays with the
+      ! optics rather than being restated here. Neither aerocore, nrho, apart nor
+      ! rhop is on this path, which is deliberate: nothing is transported.
+        do jlev=1,NLEV
+         aod1(:,jlev) = ddustod(:,jlev)
+         aod2(:,jlev) = ddustod(:,jlev)*qex2/qex1
+        enddo
+       else
+      ! INTERACTIVE aerosol. aeroprof has already built the band-1 extinction
+      ! optical depth per layer from the transported number density, once per
+      ! radiation step, so the shortwave here and the longwave in lwr read one
+      ! field and cannot drift apart. Band 2 follows from the aerofile's own
+      ! ratio of extinction efficiencies, which is how the prescribed path does
+      ! it too, so the band split stays with the optics either way.
+        do jlev=1,NLEV
+         aod1(:,jlev) = daerod(:,jlev)
+         aod2(:,jlev) = daerod(:,jlev)*qex2/qex1
+        enddo
+       endif
         
        zaeru1 = SQRT((1.0-ssa1+2*bscat1*ssa1)/(1.0-ssa1)) ! u-factor band 1
        zaeru2 = SQRT((1.0-ssa2+2*bscat2*ssa2)/(1.0-ssa2)) ! u-factor band 2
@@ -1848,7 +2154,7 @@
 !       endif
 
        do jlev=1,NLEV
-        where(losun(:) .and. nrho(:,jlev) > 0.)
+        where(losun(:) .and. aod1(:,jlev) > 0.)
          zaertf1(:,jlev) = MIN(25.,(ztemp1*aod1(:,jlev))/(zmu0+zero))  ! effective t band 1
          zaertf2(:,jlev) = MIN(25.,(ztemp2*aod2(:,jlev))/(zmu0+zero)) ! effective t band 2
          zaerd1(:,jlev) = (((zaeru1+1.0)**2.0)*EXP(zaertf1(:,jlev)) - ((zaeru1-1.0)**2.0)/EXP(zaertf1(:,jlev))) ! denominator band 1
@@ -1940,9 +2246,9 @@
 !     aerosols: reflected direct light (zaerr1) and reflected scattered light (zaerr1s)
 !     in clear sky portion only (i.e. (1-dcc))
 !
-        zrb1(:,jlev)=zrcs(:,jlev)+zrcl1(:,jlev)*dcc(:,jlev)*nclouds+zaerr1(:,jlev)*(1.-dcc(:,jlev))*l_aerorad
+        zrb1(:,jlev)=zrcs(:,jlev)+zrcl1(:,jlev)*dcc(:,jlev)*nclouds+zaerr1(:,jlev)*(1.-dcc(:,jlev))*iaeron
         !zrb1(:,jlev) = zta1*zrcs(:,jlev)+(1-zta1)*zrcsu(:,jlev)+zrcl1(:,jlev)*dcc(:,jlev)
-        zrb1s(:,jlev)=zrcsu(:,jlev)+zrcl1s(:,jlev)*dcc(:,jlev)*nclouds+zaerr1s(:,jlev)*(1.-dcc(:,jlev))*l_aerorad
+        zrb1s(:,jlev)=zrcsu(:,jlev)+zrcl1s(:,jlev)*dcc(:,jlev)*nclouds+zaerr1s(:,jlev)*(1.-dcc(:,jlev))*iaeron
 !
 !     b) T
 !
@@ -1969,8 +2275,24 @@
 !
 !     total T = 1-(A(ozon)+R(rayl.))*(1-dcc)-R(cloud)*dcc
 !
-        ztb1(:,jlev)=1.-(1.-zto3(:))*(1.-dcc(:,jlev))-zrb1(:,jlev)   
-        ztb1u(:,jlev)=1.-(1.-zto3u(:))*(1.-dcc(:,jlev))-zrb1s(:,jlev) 
+!
+!     Band 1 aerosol ABSORPTION. zaert1 and zaert1s were computed above and then
+!     never used: upstream applies the aerosol to band 2's transmission and to
+!     band 1's reflection only, so band 1 scattered but could not absorb. Band 1
+!     carries a large share of this star's flux and mineral dust absorbs there,
+!     so leaving it out biases atmospheric shortwave absorption low, which is the
+!     term the whole precipitation response runs through.
+!
+!     Booked to band 1's own convention rather than band 2's. Here T is defined
+!     as 1 - A - R with the reflection already subtracted through zrb1, so what
+!     is removed is the absorption alone, 1 - T_aer - R_aer. Band 2 subtracts
+!     1 - T_aer and adds R_aer back through zrb2. Both conserve; they differ
+!     only in where the reflected part is booked.
+!
+        ztb1(:,jlev)=1.-(1.-zto3(:))*(1.-dcc(:,jlev))-zrb1(:,jlev)              &
+     &              -(1.-zaert1(:,jlev)-zaerr1(:,jlev))*(1.-dcc(:,jlev))*iaeron
+        ztb1u(:,jlev)=1.-(1.-zto3u(:))*(1.-dcc(:,jlev))-zrb1s(:,jlev)           &
+     &               -(1.-zaert1s(:,jlev)-zaerr1s(:,jlev))*(1.-dcc(:,jlev))*iaeron
 !
 !     make combined layer R_ab, R_abs, T_ab and T_abs
 !
@@ -1988,8 +2310,8 @@
 !     cloud albedo
 !     aerosol scattering from clear sky part
 !
-        zrb2(:,jlev)=zrcl2(:,jlev)*dcc(:,jlev)*nclouds+zaerr2(:,jlev)*(1.-dcc(:,jlev))*l_aerorad
-        zrb2s(:,jlev)=zrcl2s(:,jlev)*dcc(:,jlev)*nclouds+zaerr2s(:,jlev)*(1.-dcc(:,jlev))*l_aerorad
+        zrb2(:,jlev)=zrcl2(:,jlev)*dcc(:,jlev)*nclouds+zaerr2(:,jlev)*(1.-dcc(:,jlev))*iaeron
+        zrb2s(:,jlev)=zrcl2s(:,jlev)*dcc(:,jlev)*nclouds+zaerr2s(:,jlev)*(1.-dcc(:,jlev))*iaeron
 !
 !     b) T
 !
@@ -2015,10 +2337,10 @@
 !
         ztb2(:,jlev)=1.-(1.-ztwv(:))*(1.-dcc(:,jlev)*nclouds)                   &
      &              -(1.-ztcl2(:,jlev))*dcc(:,jlev)*nclouds                     &
-                    -(1.-zaert2(:,jlev))*(1.-dcc(:,jlev))*l_aerorad
+                    -(1.-zaert2(:,jlev))*(1.-dcc(:,jlev))*iaeron
         ztb2u(:,jlev)=1.-(1.-ztwvu(:))*(1.-dcc(:,jlev)*nclouds)                 &
      &               -(1.-ztcl2s(:,jlev))*dcc(:,jlev)*nclouds                   &
-                     -(1.-zaert2s(:,jlev))*(1.-dcc(:,jlev))*l_aerorad
+                     -(1.-zaert2s(:,jlev))*(1.-dcc(:,jlev))*iaeron
 !
 !     make combined layer R_ab, R_abs, T_ab and T_abs
 !
@@ -2179,6 +2501,8 @@
       real ztaucs(NHOR,NLEV)    ! clear sky transmissivity
       real ztaucc0(NHOR,NLEV)   ! layer transmissivity cloud
       real ztaucc(NHOR)         ! cloud transmissivity
+      real ztaudu0(NHOR,NLEV)   ! layer transmissivity dust
+      real ztaudu(NHOR)         ! dust transmissivity
       real ztau0(NHOR)          ! approx. layer transmissivity
       real zsumwv(NHOR)         ! effective water vapor amount
       real zsumo3(NHOR)         ! effective o3 amount
@@ -2290,6 +2614,43 @@
        else
         ztaucc0(:,jlev)=1.-dcc(:,jlev)*(1.-exp(zzf3*dql(:,jlev)*dp(:)))
        endif
+!
+!     PRESCRIBED DUST in the longwave.
+!
+!     ExoPlaSim's aerosol acts in the two shortwave bands only and this solver
+!     had no aerosol term of any kind, so the model could cool with dust and
+!     could not warm with it. For this world that is not a refinement: the
+!     shortwave-only error is of the same order as the whole quantity.
+!
+!     Dust enters exactly where cloud does, as an additional layer
+!     transmissivity multiplied into the total. It is a grey ABSORBER -- no
+!     longwave scattering, which for a micron-scale particle in the thermal
+!     infrared is the standard approximation and is stated rather than assumed
+!     -- at the same 1.66 diffusivity the cloud term uses.
+!
+!     Because it multiplies rather than adds, the overlap with water vapour and
+!     CO2 is taken care of by construction: where the gas is already opaque the
+!     dust adds nothing. That is the part the offline estimate in
+!     an offline calculation has to approximate with a declared window
+!     transmittance, and it is why the offline longwave is an upper bound.
+!
+!     The scheme is broadband, so multiplying a grey dust transmissivity into a
+!     broadband gaseous absorptivity is a random-overlap assumption. It is the
+!     same assumption already made for cloud one line above.
+!
+!     The INTERACTIVE aerosol enters the same term with its own absorption
+!     ratio and its own per-layer optical depth, and nothing else about the
+!     scheme changes. radini has already refused to run both paths at once, so
+!     these two branches cannot both contribute; the aerosol is one aerosol
+!     whichever way its column was obtained.
+!
+       if (ndustrad == 1) then
+        ztaudu0(:,jlev)=exp(-1.66*dustqlw*ddustod(:,jlev))
+       elseif (iaerint == 1) then
+        ztaudu0(:,jlev)=exp(-1.66*aeroqlw*daerod(:,jlev))
+       else
+        ztaudu0(:,jlev)=1.
+       endif
       enddo
 !
 !     b) transmissivities, effective radiations and fluxes
@@ -2297,6 +2658,7 @@
       do jlev=1,NLEV
        jlem=jlev-1
        ztaucc(:)=1.
+       ztaudu(:)=1.
        zsumwv(:)=0.
        zsumo3(:)=0.
        zsumco2(:)=0.
@@ -2363,9 +2725,13 @@
 !
         ztaucc(:)=ztaucc(:)*ztaucc0(:,jlev2)
 !
+!     dust transmisivity, accumulated the same way
+!
+        ztaudu(:)=ztaudu(:)*ztaudu0(:,jlev2)
+!
 !     total transmissivity
 !
-        ztau(:,jlev2)=ztaucs(:,jlev2)*ztaucc(:)
+        ztau(:,jlev2)=ztaucs(:,jlev2)*ztaucc(:)*ztaudu(:)
        enddo
 !
 !     upward and downward effective SBK*T**4
@@ -2374,7 +2740,7 @@
         ztau0(:)=1.-zero
         do jlev2=1,NLEV
          jlep2=jlev2+1
-         ztau0(:)=ztaucs(:,jlev2)/ztau0(:)*ztaucc0(:,jlev2)*tpofmt
+         ztau0(:)=ztaucs(:,jlev2)/ztau0(:)*ztaucc0(:,jlev2)*ztaudu0(:,jlev2)*tpofmt
          ztau0(:)=AMIN1(1.-zero,MAX(zero,ztau0(:)))
          where((zst4(:,jlev2)-zst4h(:,jlev2))                           &
      &        *(zst4(:,jlev2)-zst4h(:,jlep2)) > 0.)
