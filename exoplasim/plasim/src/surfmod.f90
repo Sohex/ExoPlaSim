@@ -256,6 +256,10 @@
 !     radmod arrays
 
       call surfcode( 237,'dqo3cl'  )   ! climatological ozone
+!     Prescribed dust column optical depth, band 1. DUST-11.
+!     1801-1803 are deliberately NOT used: aeolian/notes/in-model-dust.md
+!     reserves them for the in-model emission scheme's three source fields.
+      call surfcode(1811,'ddustcol')   ! prescribed dust, band-1 column AOD
 
 !     Scan start_data for codes and store sequence number
 !     Write surf-code files if not existent
