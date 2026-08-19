@@ -13,7 +13,7 @@
                         cose,cosp,acosp,dlat,rcap,        &
                         cnst,deform,zcross,               &
                         fill,mfct,debug,nud,angle,land,   &
-                        aerosw,l_aerorad)
+                        aerosw,l_aerorad,prec)
 !****6***0*********0*********0*********0*********0*********0**********72
 !
 ! The subroutine aerocore is a duplicate of the tracer transport
@@ -248,6 +248,7 @@
 ! Alternatively, one can use the MFCT option to enforce monotonicity.
 !
       use pumamod, only: NLAT,NLON,NLEV,ga,deltsec ! Planet gravity and timestep from pumamod
+      use aeromod, only: ldepvel,vdaero,lwetdep,scava,scavb ! Removal switches
       implicit none
 
 ! Input-Output variables
@@ -297,6 +298,9 @@
       real ::   angle(im,jm) ! Array for cosine of solar zenith angle
       real ::   land(im,jm) ! Array for binary land mask
       real ::   aerosw(im,jm,nl) ! Array for net SW flux
+      real,intent(in) :: prec(im,jm) ! Total precipitation rate (m/s), for lwetdep
+      real ::   zdz(im,jm) ! Geometric thickness of the bottom layer (m)
+      real ::   zlam(im,jm) ! Below-cloud scavenging rate (1/s)
 
 ! scalars
 
@@ -881,8 +885,41 @@
         mmr(:,:,:,IC) = daero(:,:,:) / delp2dyn(:,:,:)
       end select
 
-! Finally, put in a sink term at the bottom level to avoid infinite build-up of haze particles	  
-      mmr(:,:,nl,ic) = mmr(:,:,nl,ic)*10e-3
+! Dry deposition at the bottom level, over and above sedimentation.
+!
+! ldepvel = 0 keeps the legacy sink, which removes 99% of the bottom layer
+! every timestep whatever the timestep is. ldepvel = 1 replaces it with a
+! deposition velocity acting over the layer's own geometric depth, which is
+! the only form whose implied removal rate is independent of the step.
+!
+! vdaero is the NON-gravitational part on purpose. Settling out of the bottom
+! layer is already taken by the gz(nl) term in the final update above, so
+! adding a Stokes velocity here would deposit the same mass twice.
+      select case (ldepvel)
+      case(0)
+        mmr(:,:,nl,ic) = mmr(:,:,nl,ic)*10e-3
+      case(1)
+        zdz(:,:) = delp2dyn(:,:,nl)/max(rhog(:,:,nl)*ga,1.E-6)
+        mmr(:,:,nl,ic) = mmr(:,:,nl,ic)                                    &
+                       * exp(-min(vdaero*deltsec/max(zdz(:,:),1.0),50.))
+      end select
+
+! Below-cloud wet scavenging, Sportisse (2007): Lambda = A p**B with p in
+! mm/h, which is the form and the coefficients aeolian/config/dust.yaml
+! already carries for the offline chain. prec arrives in m/s, hence 3.6E6.
+!
+! Applied to the whole column rather than below a diagnosed cloud base. That
+! is the offline chain's own approximation, kept deliberately so the two agree
+! in form; it overstates the scavenging of aerosol sitting above the
+! precipitating layer and is the first thing to refine if the wet sink turns
+! out to dominate more than the offline chain says it should.
+      if (lwetdep == 1) then
+        zlam(:,:) = scava*(max(prec(:,:),0.)*3.6E6)**scavb
+        do k=1,nl
+          mmr(:,:,k,ic) = mmr(:,:,k,ic)*exp(-min(zlam(:,:)*deltsec,50.))
+        enddo
+      endif
+
       where(mmr .lt. 0.) mmr = 0.0
       
       call mmr2n(mmr(:,:,:,ic),apart,rhop,rhog,im,jm,nl,numrhos(:,:,:,ic))
