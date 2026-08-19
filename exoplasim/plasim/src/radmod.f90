@@ -32,6 +32,20 @@
       character(len=128) :: aerofile = " " ! Name/path to file constaining aerosol optical data
       
       real    :: gsol0   = 1367.0 ! solar constant (set in planet module)
+      integer :: nsolcycle = 0    ! switch for sinusoidal stellar-flux cycle
+      integer :: gsolstart = 0    ! absolute model step at cycle phase zero
+      real    :: gsolamp = 0.0    ! cycle semi-amplitude (W/m2)
+      real    :: gsolperiod = 1.0 ! cycle period (model timesteps)
+      real    :: gsolphase = 0.0  ! phase offset (cycles; zero=mean, rising)
+!     Second, independent component. A real activity cycle is not one
+!     sinusoid -- epsilon Eridani carries a short and a long period at once --
+!     and this world superposes a medium climatic cycle on a long geomorphic
+!     one. The two periods are deliberately non-commensurate, so the deepest
+!     minima drift instead of repeating on a fixed beat. Amplitude zero
+!     disables it and a one-component run behaves exactly as before.
+      real    :: gsolamp2 = 0.0    ! second semi-amplitude (W/m2)
+      real    :: gsolperiod2 = 1.0 ! second period (model timesteps)
+      real    :: gsolphase2 = 0.0  ! second phase offset (cycles)
       real    :: solclat = 1.0    ! cos of lat of insolation if ncstsol=1
       real    :: solcdec = 1.0    ! cos of dec of insolation if ncstsol=1
       real    :: clgray  = -1.0   ! cloud grayness (-1 = computed)
@@ -732,7 +746,9 @@
      &               ,nsol,nclouds,nswrcl,nrscat,rcl1,rcl2,acl2,clgray,tpofmt   &
      &               ,acllwr,tswr1,tswr2,tswr3,th2oc,dawn,starbbtemp,nstartemp  &
      &               ,nsimplealbedo,nstarfile,starfile,starfilehr,minwavel      &
-     &               ,ndustrad,dustsc,dusthsc,dustqlw,aerofile,aeroqlw
+     &               ,ndustrad,dustsc,dusthsc,dustqlw,aerofile,aeroqlw          &
+     &               ,nsolcycle,gsolstart,gsolamp,gsolperiod,gsolphase   &
+     &               ,gsolamp2,gsolperiod2,gsolphase2
 !
 !     namelist parameter:
 !
@@ -889,6 +905,14 @@
       call mpbcr(o3scale)
       call mpbcr(co2)
       call mpbcr(gsol0)
+      call mpbci(nsolcycle)
+      call mpbci(gsolstart)
+      call mpbcr(gsolamp)
+      call mpbcr(gsolperiod)
+      call mpbcr(gsolphase)
+      call mpbcr(gsolamp2)
+      call mpbcr(gsolperiod2)
+      call mpbcr(gsolphase2)
       call mpbcr(solclat)
       call mpbcr(solcdec)
       call mpbcr(clgray)
@@ -1972,6 +1996,7 @@
       real zrcsu(NHOR,NLEV)  ! clear sky reflexivity (upward beam)
 !
       real zftop1(NHOR),zftop2(NHOR) ! top solar radiation
+      real gsolinst,zcyclephase,zcyclephase2 ! instantaneous cyclic stellar flux
       real zfu1(NHOR),zfu2(NHOR)     ! upward fluxes
       real zfd1(NHOR),zfd2(NHOR)     ! downward fluxes
 !
@@ -2058,8 +2083,18 @@
 !
 !     top solar radiation downward
 !
-      zftop1(:) = zsolar1 * gsol0 * gdist2 * zmu1(:) !Adjust down here for redder spectrum. --AYP
-      zftop2(:) = zsolar2 * gsol0 * gdist2 * zmu1(:)
+      gsolinst = gsol0
+      if (nsolcycle > 0 .and. gsolperiod > 0.0) then
+         zcyclephase = TWOPI * (real(nstep-gsolstart) / gsolperiod + gsolphase)
+         gsolinst = gsol0 + gsolamp * sin(zcyclephase)
+         if (gsolperiod2 > 0.0 .and. gsolamp2 /= 0.0) then
+            zcyclephase2 = TWOPI * (real(nstep-gsolstart) / gsolperiod2   &
+     &                              + gsolphase2)
+            gsolinst = gsolinst + gsolamp2 * sin(zcyclephase2)
+         endif
+      endif
+      zftop1(:) = zsolar1 * gsolinst * gdist2 * zmu1(:) !Adjust down here for redder spectrum. --AYP
+      zftop2(:) = zsolar2 * gsolinst * gdist2 * zmu1(:)
 
 !     from this point on, all computations are made only for
 !     points with solar insolation > zero
