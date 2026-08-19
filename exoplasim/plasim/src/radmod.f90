@@ -57,6 +57,22 @@
 !     bit-identical.
       real    :: o3uvw   = 1.0    ! weight, Hartley-Huggins UV terms
       real    :: o3visw  = 1.0    ! weight, Chappuis visible term
+!     The same correction in the larger term. Lacis & Hansen's water vapour
+!     absorptance is their Eq. 21, a fit to Yamamoto (1962), and Yamamoto states
+!     the definition outright: the ratio to the SOLAR CONSTANT of the energy
+!     absorbed by the whole air column. It is a fraction of total incident flux
+!     and the Sun's spectrum is inside it, because Yamamoto built it by weighting
+!     laboratory band absorptivities with the solar flux and summing them.
+!
+!     Dividing by zsolar2 below converts it to a fraction of band-2 flux and then
+!     multiplies it back by band-2 flux, so the two cancel and the ABSORBED FLUX
+!     is Lacis & Hansen's solar value for any star at all. A redder host puts
+!     more of its flux in the near infrared where water vapour absorbs, and gets
+!     the Sun's absorption anyway. h2osww is that band re-weighting.
+!
+!     Default 1.0 reproduces Lacis & Hansen exactly, so a solar-host run is
+!     bit-identical.
+      real    :: h2osww  = 1.0    ! weight, near-infrared H2O bands
       integer :: no3     = 1      ! switch for ozon (0=no,1=yes,2=datafile)
       integer :: nsol    = 1      ! switch for solang (1/0=yes/no)
       integer :: nswr    = 1      ! switch for swr (1/0=yes/no)
@@ -651,7 +667,7 @@
 !
       namelist/radmod_nl/ndcycle,ncstsol,solclat,solcdec,no3,co2        &
      &               ,iyrbp,nswr,nlwr,nfixed,slowdown,nradice,npbroaden,desync    &
-     &               ,o3uvw,o3visw   &
+     &               ,o3uvw,o3visw,h2osww   &
      &               ,a0o3,a1o3,aco3,bo3,co3,toffo3,o3scale,newrsc,necham,necham6   &
      &               ,nsol,nclouds,nswrcl,nrscat,rcl1,rcl2,acl2,clgray,tpofmt   &
      &               ,acllwr,tswr1,tswr2,tswr3,th2oc,dawn,starbbtemp,nstartemp  &
@@ -809,6 +825,7 @@
       call mpbcr(toffo3)
       call mpbcr(o3uvw)
       call mpbcr(o3visw)
+      call mpbcr(h2osww)
       call mpbcr(o3scale)
       call mpbcr(co2)
       call mpbcr(gsol0)
@@ -2110,7 +2127,8 @@
      &           +o3uvw*0.0658*zo3(:)/(1.+(103.6*zo3(:))**3))/zsolar1
        ztwvt(:)=1.
        zwv(:)=zywvt(:)+zbetta*zwvt(:)
-       ztwvtu(:)=1.-2.9*zwv(:)/((1.+141.5*zwv(:))**0.635+5.925*zwv(:))  &
+       ztwvtu(:)=1.-h2osww*2.9*zwv(:)                                   &
+     &            /((1.+141.5*zwv(:))**0.635+5.925*zwv(:))              &
      &            /zsolar2
 !
 !     clear sky scattering (Rayleigh scatterin lower most level only)
@@ -2221,7 +2239,8 @@
 !     downward beam
 !
        zwv(:)=zywvl(:,jlev)
-       ztwv(:)=(1.-2.9*zwv(:)/((1.+141.5*zwv(:))**0.635+5.925*zwv(:))   &
+       ztwv(:)=(1.-h2osww*2.9*zwv(:)                                    &
+     &            /((1.+141.5*zwv(:))**0.635+5.925*zwv(:))              &
      &            /zsolar2)                                             &
      &        /ztwvt(:)
        ztwvt(:)=ztwvt(:)*ztwv(:)
@@ -2230,7 +2249,8 @@
 !
        zwv(:)=zywvt(:)+zbetta*(zwvt(:)-zwvl(:,jlev))
        ztwvu(:)=ztwvtu(:)                                               &
-     &         /(1.-2.9*zwv(:)/((1.+141.5*zwv(:))**0.635+5.925*zwv(:))  &
+     &         /(1.-h2osww*2.9*zwv(:)                                   &
+     &            /((1.+141.5*zwv(:))**0.635+5.925*zwv(:))              &
      &            /zsolar2)
        ztwvtu(:)=ztwvtu(:)/ztwvu(:)
 !
