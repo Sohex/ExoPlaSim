@@ -257,9 +257,25 @@
 
       call surfcode( 237,'dqo3cl'  )   ! climatological ozone
 !     Prescribed dust column optical depth, band 1. DUST-11.
-!     1801-1803 are deliberately NOT used: aeolian/notes/in-model-dust.md
-!     reserves them for the in-model emission scheme's three source fields.
       call surfcode(1811,'ddustcol')   ! prescribed dust, band-1 column AOD
+
+!     aeromod arrays: the in-model dust emission's source map. DUST-3.
+!
+!     Three and no fewer, and the split is decided by where each quantity
+!     enters the flux rather than by tidiness. Two of the offline chain's
+!     terms are linear prefactors and can be multiplied together outside the
+!     model; the third enters inside the nonlinearity and cannot.
+!
+!     A composite folding the drag partition into dsrcw would be WRONG: the
+!     partition multiplies u* before it is squared, compared against a
+!     threshold and raised to the fragmentation exponent, so it does not
+!     commute out to a prefactor.
+!
+!     All three are pure functions of terrain, lithology, the lake solution
+!     and the soil, written by aeolian/scripts/build_dust_source_fields.py.
+      call surfcode(1801,'dsrcw'  )   ! erodible fraction x clipped clay fraction
+      call surfcode(1802,'ddrage' )   ! MB95 drag partition of the erodible bed
+      call surfcode(1803,'dwpr'   )   ! Fecan residual soil moisture w', percent
 
 !     Scan start_data for codes and store sequence number
 !     Write surf-code files if not existent

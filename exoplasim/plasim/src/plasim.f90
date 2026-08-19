@@ -233,6 +233,13 @@ plasimversion = "https://github.com/Edilbert/PLASIM/ : 15-Dec-2015"
       call mpbci(nsela   ) ! 1: semi lagrangian advection enabled
       call mpbci(l_aero  ) ! 1: aerosols enabled
 
+!     The dust emission scheme's three boundary fields, codes 1801-1803.
+!     This is called by EVERY rank and aero_ini is not: aero_ini sits inside
+!     the mypid == NROOT block above, and mpsurfgp is collective, so the read
+!     cannot live there. It is a no-op unless aero_nl sets ldustemit = 1.
+
+      if (nsela > 0 .and. l_aero > 0) call aero_surf
+
       call mpbci(nstep   ) ! current timestep
       call mpbci(mstep   ) ! current timestep in month
       call mpbci(ntspd   ) ! number of timesteps per day

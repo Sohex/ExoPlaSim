@@ -86,6 +86,94 @@
       real :: scava  = 0.0
       real :: scavb  = 0.0
 
+!     Wind-driven dust emission, Kok et al. (2014) equation 18. OFF by default,
+!     for the same WORKFLOW.md A3 reason the removal switches are: both arms of
+!     an A/B have to come from one executable.
+!
+!     WHAT IS IN THE MODEL AND WHAT IS NOT. The per-cell source map stays
+!     OUTSIDE: which ground can emit is a question about lithology, the lake
+!     solution and the soil, and answering it needs the mesh export that the
+!     climate model has never seen. Three surface boundary fields carry the
+!     answer in, and everything time-varying -- friction velocity, soil water,
+!     snow -- comes from the model's own state. That is the same boundary this
+!     project already draws for albedo, roughness and soil-water capacity.
+!
+!       1801  dsrcw   erodible fraction x clipped clay fraction. Both are
+!                     LINEAR prefactors on the flux, so their product is
+!                     sufficient and a second field would be redundant.
+!       1802  ddrage  the Marticorena-Bergametti (1995) drag partition, the
+!                     fraction of the stress that reaches the erodible bed.
+!                     Separate because it scales u* itself, so it sits inside
+!                     the threshold comparison and inside the exponent and
+!                     cannot be commuted out to a prefactor.
+!       1803  dwpr    the Fecan et al. (1999) residual moisture w', percent.
+!                     Separate because the moisture gate also needs the
+!                     model's own soil water, which is already in memory.
+!
+!     ldustemit  0 = the legacy source, mmr(bottom) = fcoeff*land, which emits
+!                    as much from forest as from salt pan and SETS rather than
+!                    adds. This is the default and it reproduces the unpatched
+!                    model exactly.
+!                1 = Kok 18 evaluated over a Weibull distribution of subgrid
+!                    wind and ADDED as a flux: d(mmr) = F g dt / dp.
+!
+!     Everything below is a calibration and every one of them lives in
+!     aeolian/config/dust.yaml. None has a Fortran default, for the reason
+!     vdaero has none: a plausible-looking number here would be a fourth place
+!     for a constant that one file already owns, and it would go stale in
+!     silence. aero_ini ABORTS on ldustemit = 1 with any of them unset.
+!
+!     dustz0   aeolian roughness of the erodible bed itself, m. NOT the grid
+!              cell roughness: MB95 partitions stress between a bed and
+!              centimetre-scale roughness ELEMENTS, and a 15 km orographic
+!              variance is not a roughness element. dust.yaml carries the
+!              argument and the bracket.
+!     dustust0 standardized threshold friction velocity of an optimally
+!              erodible bed, m/s, ALREADY SCALED for this planet's gravity.
+!              The scaling is the fourth root of the gravity ratio and it is
+!              applied outside, where config/planet.yaml's gravity lives.
+!     dustustt the same for a typical erodible soil, m/s, likewise scaled.
+!     dustra0  the standardization air density, kg/m3. Kok equation 6.
+!     dustcd0  Cd0 of equation 18b, dimensionless.
+!     dustce   Ce of equation 18b, dimensionless.
+!     dustca   C_alpha of equation 18a, dimensionless.
+!     dustwk   Weibull shape of the subgrid wind distribution. NOT optional:
+!              emission goes as roughly u* cubed above a threshold, so the
+!              flux of the mean and the mean of the flux differ by orders of
+!              magnitude. Measured rather than declared; see dust.yaml.
+!     dustnq   quadrature points across that distribution.
+!     dustfa   A of Fecan equation 14.
+!     dustfb   b of Fecan equation 14.
+!     dustsnd  snow depth in m above which a cell emits nothing.
+!     dustwcv  converts the model's soil water, a DEPTH in m, into gravimetric
+!              soil moisture in percent. It is 100000/(soil depth x bulk
+!              density) and both of those are declared in dust.yaml.
+      integer :: ldustemit = 0
+      integer :: dustnq  = 0
+      real :: dustz0   = 0.0
+      real :: dustust0 = 0.0
+      real :: dustustt = 0.0
+      real :: dustra0  = 0.0
+      real :: dustcd0  = 0.0
+      real :: dustce   = 0.0
+      real :: dustca   = 0.0
+      real :: dustwk   = 0.0
+      real :: dustfa   = 0.0
+      real :: dustfb   = 0.0
+      real :: dustsnd  = 0.0
+      real :: dustwcv  = 0.0
+
+!     The three boundary fields, distributed as landmod holds its own surface
+!     fields, and gathered ONCE into the global arrays aerocore works on.
+!     aerocore runs serial on NROOT with the whole global grid, so a per-step
+!     gather of a field that never changes would be pure cost.
+      real :: dsrcw(NHOR)  = 0.0   ! code 1801, distributed
+      real :: ddrage(NHOR) = 0.0   ! code 1802, distributed
+      real :: dwpr(NHOR)   = 0.0   ! code 1803, distributed
+      real :: gsrcw(NLON,NLAT)  = 0.0  ! the same, gathered and flipped
+      real :: gdrage(NLON,NLAT) = 0.0
+      real :: gwpr(NLON,NLAT)   = 0.0
+
       end module aeromod
 
 !     ==================
@@ -97,7 +185,10 @@
       use radmod, only: l_aerorad, aerofile
       
       namelist/aero_nl/l_source,l_bulk,apart,rhop,fcoeff,l_aerorad,aerofile  &
-     &                ,ldepvel,vdaero,lwetdep,scava,scavb
+     &                ,ldepvel,vdaero,lwetdep,scava,scavb                    &
+     &                ,ldustemit,dustz0,dustust0,dustustt,dustra0            &
+     &                ,dustcd0,dustce,dustca,dustwk,dustnq                   &
+     &                ,dustfa,dustfb,dustsnd,dustwcv
 
       if (mypid==NROOT) then
          open(11,file=aero_namelist)
@@ -130,10 +221,134 @@
             write(nud,*) '* bracket on scava.'
             call mpabort('aero_nl: lwetdep = 1 without scava and scavb')
          endif
+!
+!        The emission scheme's calibration has no Fortran defaults either, and
+!        for the same reason: aeolian/config/dust.yaml owns every one of these
+!        and a number invented here would be a fourth place for it to go stale.
+!        The abort is the loud failure and it is the one to want -- a silently
+!        zeroed threshold would emit from the whole planet at every wind.
+!
+         if (ldustemit == 1) then
+            if (dustz0   <= 0.0 .or. dustust0 <= 0.0 .or.                    &
+     &          dustustt <= 0.0 .or. dustra0  <= 0.0 .or.                    &
+     &          dustcd0  <= 0.0 .or. dustce   <= 0.0 .or.                    &
+     &          dustca   <= 0.0 .or. dustwk   <= 0.0 .or.                    &
+     &          dustnq   <= 0   .or. dustfa   <= 0.0 .or.                    &
+     &          dustfb   <= 0.0 .or. dustsnd  <= 0.0 .or.                    &
+     &          dustwcv  <= 0.0) then
+               write(nud,*) '* ldustemit = 1 needs the whole Kok (2014)'
+               write(nud,*) '* calibration: dustz0, dustust0, dustustt,'
+               write(nud,*) '* dustra0, dustcd0, dustce, dustca, dustwk,'
+               write(nud,*) '* dustnq, dustfa, dustfb, dustsnd, dustwcv.'
+               write(nud,*) '* All of them live in aeolian/config/dust.yaml'
+               write(nud,*) '* and are written into aero_namelist by'
+               write(nud,*) '* exoplasim/scripts/run_exoplasim.py from the'
+               write(nud,*) '* provenance file beside the 1801-1803 fields.'
+               call mpabort('aero_nl: ldustemit = 1 without its calibration')
+            endif
+            if (dustustt < dustust0) then
+               write(nud,*) '* dustustt is below dustust0. u*st0 is the'
+               write(nud,*) '* OPTIMALLY erodible bed and is the minimum of'
+               write(nud,*) '* the threshold curve, so nothing can sit under'
+               write(nud,*) '* it. Kok equation 18b would return Cd above Cd0'
+               write(nud,*) '* and the exponent would change sign.'
+               call mpabort('aero_nl: dustustt < dustust0')
+            endif
+         endif
       endif
       
       return
       end subroutine aero_ini
+
+!     ===================
+!     SUBROUTINE AERO_SURF
+!     ===================
+
+      subroutine aero_surf
+
+!     Read the three dust-source boundary fields and put them where aerocore
+!     can see them. Called from plasim.f90 by EVERY rank, which is the whole
+!     reason this is not folded into aero_ini: aero_ini runs inside an
+!     `if (mypid == NROOT)` block, and mpsurfgp is collective -- it broadcasts
+!     the read flag and scatters the field, so a rank that does not enter it
+!     hangs.
+!
+!     Once, not per step. aerocore runs serial on NROOT over the whole global
+!     grid, so it needs these gathered; they are pure functions of terrain,
+!     lithology, the lake solution and the soil and never change, so gathering
+!     them every timestep would be cost for nothing.
+!
+!     THE LATITUDE FLIP IS NOT OPTIONAL. mpgagp returns a field in the MODEL's
+!     latitude order, while plasim.f90 hands aerocore its tracer array flipped
+!     south-to-north (`daeros(:,NLAT+1-jlat,:,1) = zmmr(:,jlat,:)`). Upstream
+!     omitted the flip on the land mask and the solar zenith angle and drove
+!     the aerosol source in the mirror hemisphere; that is defect 7 of
+!     exoplasim-3.4.2-aerocore-defects.patch and this is the same convention,
+!     written the same way round, on purpose.
+
+      use aeromod
+      implicit none
+
+      real :: zgath(NLON,NLAT,1)
+      real :: zmax
+      integer :: j
+
+!     ldustemit is read by aero_ini on NROOT only. Everything downstream of it
+!     runs on NROOT too, but THIS routine does not: mpsurfgp is collective, so
+!     every rank has to agree about whether it is called at all.
+
+      call mpbci(ldustemit)
+      if (ldustemit /= 1) return
+
+      dsrcw(:)  = 0.0
+      ddrage(:) = 0.0
+      dwpr(:)   = 0.0
+      call mpsurfgp('dsrcw' ,dsrcw ,NHOR,1)
+      call mpsurfgp('ddrage',ddrage,NHOR,1)
+      call mpsurfgp('dwpr'  ,dwpr  ,NHOR,1)
+
+      call mpmaxval(dsrcw,NHOR,1,zmax)
+      if (zmax <= 0.0) then
+         if (mypid == NROOT) then
+            write(nud,*) 'DUST EMISSION: no source field was read.'
+            write(nud,*) 'Expected surface codes 1801, 1802 and 1803 in the'
+            write(nud,*) 'run directory, written by'
+            write(nud,*) 'aeolian/scripts/build_dust_source_fields.py.'
+            write(nud,*) 'surfmod skips a missing surface file in silence, so'
+            write(nud,*) 'the alternative to this abort is a run that emits'
+            write(nud,*) 'nothing and says nothing.'
+         endif
+         call mpabort('ldustemit=1 but surface code 1801 is absent or zero')
+      endif
+
+      call mpgagp(zgath,dsrcw,1)
+      do j = 1 , NLAT
+         gsrcw(:,NLAT+1-j) = zgath(:,j,1)
+      end do
+      call mpgagp(zgath,ddrage,1)
+      do j = 1 , NLAT
+         gdrage(:,NLAT+1-j) = zgath(:,j,1)
+      end do
+      call mpgagp(zgath,dwpr,1)
+      do j = 1 , NLAT
+         gwpr(:,NLAT+1-j) = zgath(:,j,1)
+      end do
+
+      if (mypid == NROOT) then
+         write(nud,'(/," *********************************************")')
+         write(nud,'(" * DUST EMISSION (codes 1801-1803) is ON     *")')
+         write(nud,'(" *********************************************")')
+         write(nud,*) 'max erodible x clay prefactor  ',maxval(gsrcw)
+         write(nud,*) 'drag partition, min and max    ',minval(gdrage),       &
+     &                                                  maxval(gdrage)
+         write(nud,*) 'Fecan w (percent), max         ',maxval(gwpr)
+         write(nud,*) 'aeolian roughness (m)          ',dustz0
+         write(nud,*) 'u*st0, u*st typical (m/s)      ',dustust0,dustustt
+         write(nud,*) 'Weibull shape, quadrature      ',dustwk,dustnq
+      endif
+
+      return
+      end subroutine aero_surf
   
   
 !     ======================
@@ -144,7 +359,8 @@
 
       use pumamod, only: du,dv,dp,du0,dv0,dp0,daeros,numrhos, &
                          NLON,NLAT,NLEV,NAERO,NHOR,   &
-                         mypid,NROOT,sigmah,dt,dls,dswfl,dprl,dprc
+                         mypid,NROOT,sigmah,dt,dls,dswfl,dprl,dprc, &
+                         dsnow,dwatc
       use tracermod
       use aeromod
       use radmod, only: gmu0, l_aerorad ! Use cosine of solar zenith angle from radmod;
@@ -172,6 +388,9 @@
 
       real ::   prec(NLON,NLAT) ! Total precipitation rate (m/s), for lwetdep
       real ::   zprec(NHOR)     ! the same before gathering
+
+      real ::   snow(NLON,NLAT)  ! Snow depth (m), for the emission gate
+      real ::   wsoil(NLON,NLAT) ! Soil water (m), for the Fecan threshold
 
       integer :: j,jc
 
@@ -227,6 +446,29 @@
          end do
       end if
 
+!     Snow depth and soil water for the emission scheme, gathered only when it
+!     is on so that ldustemit = 0 costs nothing and reproduces the unpatched
+!     model exactly. These two are the whole of what the source term takes from
+!     the model's evolving state that is not already in aerocore: the wind is
+!     zu and zv, which prepare_uvps has already gathered AND flipped, and the
+!     air density and temperature are rhog and temp inside aerocore.
+!
+!     Flipped in latitude like every other field gathered here. See aero_surf
+!     for why that is not optional and what it cost upstream.
+
+      snow(:,:)  = 0.0
+      wsoil(:,:) = 0.0
+      if (ldustemit == 1) then
+         call mpgagp(zgath,dsnow,1)
+         do j=1,NLAT
+            snow(:,NLAT+1-j) = zgath(:,j,1)
+         end do
+         call mpgagp(zgath,dwatc,1)
+         do j=1,NLAT
+            wsoil(:,NLAT+1-j) = zgath(:,j,1)
+         end do
+      end if
+
       if (mypid == NROOT .and. aero_debug) then
          write(nud,'(a,f11.2)') '* max aero u   =',maxval(abs(zu))
          write(nud,'(a,f11.2)') '* max v   =',maxval(abs(zv))
@@ -254,7 +496,8 @@
                       colae,colad,rcolad,dlat,rcap,       &
                       aero_cnst,aero_deform,aero_zcross,  &
                       aero_fill,aero_mfct,aero_debug,nud, &
-                      angle,land,aerosw,l_aerorad,prec)
+                      angle,land,aerosw,l_aerorad,prec, &
+                      snow,wsoil)
 
 !        preparation for the GUI output: 
 !        invert the meridional direction and add the 360 deg. longitude

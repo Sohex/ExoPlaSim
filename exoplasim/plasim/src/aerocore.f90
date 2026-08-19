@@ -13,7 +13,7 @@
                         cose,cosp,acosp,dlat,rcap,        &
                         cnst,deform,zcross,               &
                         fill,mfct,debug,nud,angle,land,   &
-                        aerosw,l_aerorad,prec)
+                        aerosw,l_aerorad,prec,snow,wsoil)
 !****6***0*********0*********0*********0*********0*********0**********72
 !
 ! The subroutine aerocore is a duplicate of the tracer transport
@@ -248,7 +248,8 @@
 ! Alternatively, one can use the MFCT option to enforce monotonicity.
 !
       use pumamod, only: NLAT,NLON,NLEV,ga,deltsec ! Planet gravity and timestep from pumamod
-      use aeromod, only: ldepvel,vdaero,lwetdep,scava,scavb ! Removal switches
+      use aeromod, only: ldepvel,vdaero,lwetdep,scava,scavb, & ! Removal switches
+                         ldustemit                            ! Emission switch
       implicit none
 
 ! Input-Output variables
@@ -299,6 +300,9 @@
       real ::   land(im,jm) ! Array for binary land mask
       real ::   aerosw(im,jm,nl) ! Array for net SW flux
       real,intent(in) :: prec(im,jm) ! Total precipitation rate (m/s), for lwetdep
+      real,intent(in) :: snow(im,jm)  ! Snow depth (m), for ldustemit
+      real,intent(in) :: wsoil(im,jm) ! Soil water (m), for ldustemit
+      real ::   zdmmr(im,jm) ! Mixing ratio emitted into the bottom layer per step
       real ::   zdz(im,jm) ! Geometric thickness of the bottom layer (m)
       real ::   zlam(im,jm) ! Below-cloud scavenging rate (1/s)
 
@@ -611,6 +615,14 @@
     call vterm(im,jm,nl,beta,apart,rhop,mu,temp,sigmah,ps2,rhog,nud,vels)	
 
 !****6***0*********0*********0*********0*********0*********0**********72
+! Wind-driven dust emission, once per timestep rather than once per tracer.
+! A no-op returning zero unless ldustemit = 1, which is the default, so the
+! only cost at ldustemit = 0 is the call itself.
+!****6***0*********0*********0*********0*********0*********0**********72
+
+      call dustsrc(im,jm,nl,u,v,temp,rhog,delp1,snow,wsoil,zdmmr)
+
+!****6***0*********0*********0*********0*********0*********0**********72
 ! Do transport one tracer at a time.
 !****6***0*********0*********0*********0*********0*********0**********72
  
@@ -626,7 +638,16 @@
        case(1) ! Case 1: photochemical haze
          mmr(:,:,1,ic) = fcoeff*angle ! The coefficient fcoeff sets the haze mass production rate at the solar zenith at k=1
        case(2)
-         mmr(:,:,NLEV,ic) = fcoeff*land ! At k=surface, land grid boxes are given the abundance fcoeff (kg/kg) and sea is given 0
+! ldustemit = 0 keeps the legacy source, which SETS the bottom-level mixing
+! ratio to fcoeff over land -- as much from forest as from salt pan, and a
+! concentration rather than a flux. ldustemit = 1 ADDS the Kok (2014) emission
+! that dustsrc computed above. Both arms come from one executable, which is
+! WORKFLOW.md A3 and the reason for the switch.
+         if (ldustemit == 1) then
+           mmr(:,:,nl,ic) = mmr(:,:,nl,ic) + zdmmr(:,:)
+         else
+           mmr(:,:,NLEV,ic) = fcoeff*land ! At k=surface, land grid boxes are given the abundance fcoeff (kg/kg) and sea is given 0
+         endif
        end select
       end if
       
@@ -635,7 +656,11 @@
        case(1) ! Case 1: photochemical haze
          mmr(:,:,1,ic) = fcoeff*(abs(aerosw(:,:,1))/(maxval(abs(aerosw(:,:,1))) + 1.E-6)) ! At the max SW flux, the source strength is the input source
        case(2) ! Case 2: dust
-         mmr(:,:,NLEV,ic) = fcoeff*land ! At k=surface, land grid boxes are given the abundance fcoeff (kg/kg) and sea is given 0
+         if (ldustemit == 1) then
+           mmr(:,:,nl,ic) = mmr(:,:,nl,ic) + zdmmr(:,:)
+         else
+           mmr(:,:,NLEV,ic) = fcoeff*land ! At k=surface, land grid boxes are given the abundance fcoeff (kg/kg) and sea is given 0
+         endif
        end select
       end if
       
@@ -1244,5 +1269,192 @@
     
     mmr = numrho*mpart/rhog
     
+    RETURN
+    END
+
+!****6***0*********0*********0*********0*********0*********0**********72
+    SUBROUTINE dustsrc(im,jm,nl,u,v,temp,rhog,delp1,snow,wsoil,dmmr)
+
+!   Wind-driven mineral dust emission, Kok et al. (2014) equations 18a and 18b.
+!
+!   Returns the mass mixing ratio ADDED to the bottom layer in one timestep.
+!   That is a change of kind from the source it replaces: `mmr = fcoeff*land`
+!   SETS the bottom-level concentration every step, which together with the
+!   bottom-level sink degenerates into "surface concentration is pinned" and
+!   cannot conserve anything. A flux can.
+!
+!   THE LAW, taken from the paper and not from a summary of it (Atmos. Chem.
+!   Phys. 14, 13023-13041, 2014):
+!
+!     Fd = Cd fbare fclay rho_a (u*^2 - u*t^2)/u*st (u*/u*t)^alpha, u* > u*t
+!     Cd = Cd0 exp(-Ce (u*st - u*st0)/u*st0)
+!     alpha = C_alpha (u*st - u*st0)/u*st0
+!
+!   with u*st the STANDARDIZED threshold of equation 6, u*st = u*t sqrt(rho_a/
+!   rho_a0), which is what makes it independent of air density and therefore a
+!   property of the soil alone. Chosen over Marticorena-Bergametti because the
+!   emitted size distribution follows from fragmentation physics rather than
+!   from a fit, so there is one fewer knob on a world with no observations to
+!   tune against.
+!
+!   NOT the White or Kawamura saltation flux. That form has units of kg/m/s
+!   and is the HORIZONTAL flux, which needs a sandblasting efficiency before
+!   it becomes a vertical dust emission. Kok 18 gives the vertical flux
+!   directly and its coefficients are already fitted.
+!
+!   THE THRESHOLD CARRIES THIS PLANET'S GRAVITY, and it arrives that way:
+!   dustust0 and dustustt have already been multiplied by (g/g_earth)^(1/4)
+!   outside, where config/planet.yaml's gravity lives. The FOURTH root and not
+!   the square root, because u*st0 is defined on an optimally erodible bed,
+!   which is the MINIMUM of the threshold curve, and at the minimum the
+!   cohesion parameter cancels out of the ratio; aeolian/config/dust.yaml
+!   carries the derivation. Both thresholds take the same factor, which leaves
+!   (u*st - u*st0)/u*st0 unchanged, so Cd and alpha are invariant under it.
+!
+!   THE SUBGRID WIND DISTRIBUTION IS NOT OPTIONAL, and the reason is
+!   arithmetic rather than taste. The flux goes as roughly u* cubed above a
+!   threshold, so a gridbox-mean wind emits almost nothing while the same mean
+!   with realistic variance emits a great deal: the two differ by orders of
+!   magnitude, not by a correction. Emission is therefore evaluated at
+!   equal-probability quantiles of a Weibull whose mean is the gridbox u* and
+!   averaged over them, which is Cakmur, Miller and Torres (2004). Going
+!   in-model replaces a 12-bin climatological mean wind with the model's own
+!   instantaneous one, which is the entire point of going in-model, but the
+!   gridbox is still 15 km across, so the subgrid distribution stays.
+!
+!   THE WIND IS THE MODEL'S BOTTOM LEVEL DRIVEN THROUGH THE AEOLIAN ROUGHNESS
+!   OF THE PATCH, not through the grid cell's. That is a declared position of
+!   this project and aeolian/config/dust.yaml carries the argument: MB95
+!   partitions stress between a bed and centimetre-scale roughness ELEMENTS
+!   standing on it, and a 15 km orographic variance is not a roughness
+!   element. Feeding the grid-cell roughness to the partition returns zero
+!   emission over 99% of the source area, which is a category error rather
+!   than a result. The cost is stated rather than hidden: sheltering of an
+!   erodible patch by the terrain around it is NOT represented, and that
+!   biases emission high by an unknown amount.
+
+    USE aeromod, ONLY: ldustemit,dustz0,dustust0,dustustt,dustra0,           &
+                       dustcd0,dustce,dustca,dustwk,dustnq,                  &
+                       dustfa,dustfb,dustsnd,dustwcv,                        &
+                       gsrcw,gdrage,gwpr
+    USE pumamod, ONLY: ga,gascon,sigma,deltsec
+
+    IMPLICIT NONE
+
+    INTEGER,INTENT(IN) :: im,jm,nl
+    REAL,INTENT(IN)  :: u(im,jm,nl)      ! zonal wind, m/s, aerocore latitude order
+    REAL,INTENT(IN)  :: v(im,jm,nl)      ! meridional wind, m/s
+    REAL,INTENT(IN)  :: temp(im,jm,nl)   ! air temperature, K
+    REAL,INTENT(IN)  :: rhog(im,jm,nl)   ! bulk gas density, kg/m3
+    REAL,INTENT(IN)  :: delp1(im,jm,nl)  ! layer pressure thickness at time t, Pa
+    REAL,INTENT(IN)  :: snow(im,jm)      ! snow depth, m
+    REAL,INTENT(IN)  :: wsoil(im,jm)     ! soil water, m
+    REAL,INTENT(OUT) :: dmmr(im,jm)      ! mixing ratio added to the bottom layer
+
+    REAL,PARAMETER :: VONKARM = 0.4
+
+    REAL :: zq(MAX(dustnq,1)) ! quantiles of the Weibull quadrature
+    REAL :: zsig              ! bottom full-level sigma, clipped
+    REAL :: zref              ! height of the bottom level above ground, m
+    REAL :: zust              ! friction velocity felt by the erodible bed, m/s
+    REAL :: zscale            ! Weibull scale of that friction velocity
+    REAL :: zw                ! gravimetric soil moisture, percent
+    REAL :: zex               ! moisture in excess of the Fecan residual
+    REAL :: zfm               ! Fecan factor on the threshold
+    REAL :: zustst            ! standardized threshold friction velocity, m/s
+    REAL :: zut               ! threshold friction velocity at this density, m/s
+    REAL :: zcd               ! Kok 18b dust emission coefficient
+    REAL :: zal               ! Kok 18a fragmentation exponent
+    REAL :: zrel              ! (u*st - u*st0)/u*st0
+    REAL :: zflux             ! emission summed over the quadrature, kg/m2/s
+    REAL :: zuu               ! friction velocity at one quadrature point
+    REAL :: zrho              ! bottom-level air density, kg/m3
+    REAL :: zspd              ! bottom-level wind speed, m/s
+    INTEGER :: i,j,n
+
+    dmmr(:,:) = 0.0
+    if (ldustemit /= 1) return
+
+!   Equal-probability quantiles of the Weibull: u = c (-ln(1-q))^(1/k) at
+!   q = (n-0.5)/N, which puts the points where the mass is and keeps the steep
+!   tail resolved. They depend on nothing that varies in space or time.
+
+    do n = 1 , dustnq
+       zq(n) = (-LOG(1.0 - (REAL(n)-0.5)/REAL(dustnq)))**(1.0/dustwk)
+    end do
+
+!   The bottom level's height above ground, from the model's own sigma
+!   coordinate through the hypsometric relation. Assuming 10 m would misstate
+!   u* by the ratio of two logarithms, which over a surface this smooth is not
+!   a small error.
+
+    zsig = MIN(MAX(sigma(nl),0.5),0.999)
+
+    do j = 1 , jm
+    do i = 1 , im
+
+       if (gsrcw(i,j) <= 0.0) cycle       ! nothing erodible here
+       if (snow(i,j) > dustsnd) cycle     ! snow shuts the cell off
+
+       zref = MAX((gascon*temp(i,j,nl)/ga)*LOG(1.0/zsig),2.0)
+       zspd = SQRT(u(i,j,nl)*u(i,j,nl) + v(i,j,nl)*v(i,j,nl))
+       zust = gdrage(i,j)*VONKARM*zspd/LOG(zref/dustz0)
+       if (zust <= 0.0) cycle
+
+       zrho = rhog(i,j,nl)
+
+!      Fecan et al. (1999) equations 14 and 15, and it is PIECEWISE: below the
+!      residual moisture the threshold does not move at all. w' is a pure
+!      function of clay and arrives as boundary field 1803; w is the model's
+!      own soil water, converted from a depth to a gravimetric percentage by
+!      dustwcv.
+
+       zw  = wsoil(i,j)*dustwcv
+       zex = zw - gwpr(i,j)
+       if (zex > 0.0) then
+          zfm = SQRT(1.0 + dustfa*zex**dustfb)
+       else
+          zfm = 1.0
+       endif
+
+!      u*st is density-invariant by construction, so the moisture factor is
+!      the only thing that moves it; u*t is then that threshold brought back
+!      to the local air density through equation 6.
+
+       zustst = dustustt*zfm
+       zut    = zustst*SQRT(dustra0/zrho)
+       zrel   = (zustst - dustust0)/dustust0
+       zcd    = dustcd0*EXP(-dustce*zrel)
+       zal    = dustca*zrel
+
+       zscale = zust/GAMMA(1.0 + 1.0/dustwk)
+
+       zflux = 0.0
+       do n = 1 , dustnq
+          zuu = zscale*zq(n)
+          if (zuu > zut) then
+!            The exponent is capped at e**50 as a NUMERICAL guard and not as
+!            physics. Several configure.sh targets build with
+!            -ffpe-trap=overflow, so an unbounded (u*/u*t)**alpha would abort
+!            the run rather than return an inconvenient number. The cap is
+!            twenty orders of magnitude above anything the fitted alpha can
+!            reach at a wind that also clears the threshold, and
+!            build_dust_source_fields.py --self-test asserts it never binds.
+             zflux = zflux + zcd*zrho*(zuu*zuu - zut*zut)/zustst              &
+     &                     * EXP(MIN(zal*LOG(zuu/zut),50.))
+          endif
+       end do
+       zflux = zflux/REAL(dustnq)
+
+!      gsrcw is fbare*fclay. Both are LINEAR prefactors on the flux, which is
+!      exactly why one field carries them both and a second would be
+!      redundant. The conversion from a surface flux to a mixing ratio is
+!      d(mmr) = F g dt / dp for the bottom layer.
+
+       dmmr(i,j) = zflux*gsrcw(i,j)*ga*deltsec/delp1(i,j,nl)
+
+    end do
+    end do
+
     RETURN
     END
