@@ -182,7 +182,7 @@
 
       subroutine aero_ini
       use aeromod
-      use radmod, only: l_aerorad, aerofile
+      use radmod, only: l_aerorad, aerofile, rad_apart => apart
       
       namelist/aero_nl/l_source,l_bulk,apart,rhop,fcoeff,l_aerorad,aerofile  &
      &                ,ldepvel,vdaero,lwetdep,scava,scavb                    &
@@ -255,6 +255,19 @@
                call mpabort('aero_nl: dustustt < dustust0')
             endif
          endif
+!
+!        UPSTREAM DEFECT. radmod declares its own `apart` and this namelist
+!        sets aeromod's, so the transport used the radius that was asked for
+!        while the radiation kept the 50 nm photochemical-haze default. At
+!        fixed number density the optical depth goes as apart squared, so the
+!        shortwave aerosol came out (50e-9/apart)**2 of intent -- 1/385 at the
+!        optical effective radius of this world's dust and 1/1948 at the
+!        burden-matched one. Hand the value across; radini broadcasts it,
+!        which is why this can sit inside the NROOT block. The two variables
+!        stay separate because radmod cannot use aeromod: aeromod already uses
+!        radmod, and make_plasim compiles it second.
+!
+         rad_apart = apart
       endif
       
       return

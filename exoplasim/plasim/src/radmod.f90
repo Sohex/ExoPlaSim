@@ -136,7 +136,10 @@
       real :: bscat1 = 0. ! Backscattering ratio band 1
       real :: bscat2 = 0. ! Backscattering ratio band 2
       real :: aeroqs(8,1) = 0.  ! Array to read in aerosol optical constants
-      real :: apart = 50e-09 ! Aerosol particle radius - DECLARED IN AEROMOD AS WELL
+      real :: apart = 50e-09 ! Aerosol particle radius. AEROMOD DECLARES ITS
+                             ! OWN; aero_ini copies that one into this and
+                             ! radini broadcasts it. The default is the
+                             ! photochemical haze and is not this world's dust.
 !
 !*    2.2b) PRESCRIBED DUST (DUST-11)
 !
@@ -145,7 +148,7 @@
 !     emits or removes anything. That is enough to answer what dust does to
 !     precipitation and runoff one iteration deep, and it deliberately does NOT
 !     touch aerocore, so the bottom-level sink, the settling term and the
-!     un-populated `apart` are all out of the path.
+!     interactive number density are all out of the path.
 !
 !     ddustcol is the BAND 1 (0.34-0.75 um) column extinction optical depth.
 !     Band 2 follows from the aerofile's own ratio of extinction efficiencies
@@ -694,7 +697,6 @@
      &               ,acllwr,tswr1,tswr2,tswr3,th2oc,dawn,starbbtemp,nstartemp  &
      &               ,nsimplealbedo,nstarfile,starfile,starfilehr,minwavel      &
      &               ,ndustrad,dustsc,dusthsc,dustqlw,aerofile
-     namelist/aero_nl/l_source,l_bulk,apart,rhop,fcoeff,l_aerorad,aerofile
 !
 !     namelist parameter:
 !
@@ -883,6 +885,15 @@
       call mpbcr(minwavel)
       
       call mpbci(l_aerorad)
+!
+!     aero_ini has already run, on NROOT only, and has copied aero_nl's
+!     particle radius into radmod's own. This is the broadcast that was
+!     missing: without it every rank kept the 50 nm default and the
+!     shortwave aerosol optical depth was (50e-9/apart)**2 of intent.
+!     Harmless where aero_ini never ran, because both copies are then the
+!     same default.
+!
+      call mpbcr(apart)
 
       call mpbci(ndustrad)
       call mpbcr(dustsc)
@@ -2117,8 +2128,7 @@
       ! ratio of extinction efficiencies -- which for a single mode is the ratio
       ! of the mass extinction efficiencies, so the band split stays with the
       ! optics rather than being restated here. Neither aerocore, nrho, apart nor
-      ! rhop is on this path, which is deliberate: nothing is transported, and
-      ! radmod's own `apart` is never populated from the namelist.
+      ! rhop is on this path, which is deliberate: nothing is transported.
         do jlev=1,NLEV
          aod1(:,jlev) = ddustod(:,jlev)
          aod2(:,jlev) = ddustod(:,jlev)*qex2/qex1
